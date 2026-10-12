@@ -1,0 +1,90 @@
+name: Build and optionally deploy Nginx
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t nginx-cicd-demo:ci .
+      - name: Start container
+        run: docker run -d --name nginx-cicd-ci -p 127.0.0.1:8080:80 nginx-cicd-demo:ci
+      - name: Verify HTTP responses
+        run: |
+          for attempt in {1..20}; do
+            if curl -fsS http://127.0.0.1:8080/health | grep -qx 'ok'; then break; fi
+            sleep 1
+          done
+          test "$(curl -fsS http://127.0.0.1:8080/health)" = 'ok'
+          curl -fsS http://127.0.0.1:8080/ > /dev/null
+      - name: Show container logs if failed
+        if: failure()
+        run: docker logs nginx-cicd-ci || true
+      - name: Stop container
+        if: always()
+        run: docker rm -f nginx-cicd-ci || true
+
+  publish-and-deploy:
+    needs: build-and-test
+    if: github.event_name != 'pull_request' && vars.ENABLE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set image and commit tag
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SERVER_SSH_KNOWN_HOSTS }}
+        run: |
+          test -n "$SSH_PRIVATE_KEY" && test -n "$SSH_KNOWN_HOSTS"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Copy deployment script
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          test -n "$SERVER_HOST" && test -n "$SERVER_USER"
+          scp -o BatchMode=yes scripts/deploy.sh "$SERVER_USER@$SERVER_HOST:/tmp/nginx-cicd-deploy.sh"
+      - name: Deploy and verify
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          GHCR_USER: ${{ secrets.GHCR_USER }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+          APP_PORT: ${{ vars.APP_PORT || '8080' }}
+        run: |
+          test -n "$GHCR_USER" && test -n "$GHCR_READ_TOKEN"
+          printf '%s' "$GHCR_READ_TOKEN" | ssh -o BatchMode=yes "$SERVER_USER@$SERVER_HOST" \
+            "docker login ghcr.io --username '$GHCR_USER' --password-stdin >/dev/null && IMAGE='$IMAGE' PORT='$APP_PORT' bash /tmp/nginx-cicd-deploy.sh"
